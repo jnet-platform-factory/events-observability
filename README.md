@@ -153,6 +153,7 @@ make release S3_BUCKET=my-sar-artifacts
 > **Bump `SemanticVersion`** in [template.yaml](template.yaml) before each new
 > `make publish` — SAR rejects re-publishing the same version.
 
+
 ## License
 
 Apache-2.0. See [LICENSE.txt](LICENSE.txt).
