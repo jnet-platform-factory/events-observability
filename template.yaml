@@ -1,0 +1,418 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless Events Observability — a central EventBridge bus, an error-alert
+  digest (SQS -> SNS, throttled to one email per minute), and an EventBridge ->
+  OpenSearch forwarder that indexes every platform event for search and
+  analytics. Deploys entirely into your own AWS account.
+
+Metadata:
+  AWS::ServerlessRepo::Application:
+    Name: serverless-events-observability
+    Description: >
+      Drop-in event observability for EventBridge-based serverless platforms:
+      a central event bus, throttled error-alert digests, and an OpenSearch
+      forwarder that indexes every event for search and analytics.
+    Author: CargoNaut
+    SpdxLicenseId: Apache-2.0
+    LicenseUrl: LICENSE.txt
+    ReadmeUrl: README.md
+    Labels: ['eventbridge', 'observability', 'opensearch', 'serverless', 'monitoring', 'events']
+    HomePageUrl: https://github.com/platform-factory/events-observability
+    SemanticVersion: 1.0.0
+    SourceCodeUrl: https://github.com/platform-factory/events-observability
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: events-observability
+    Description: >
+      Prefix applied to all created resource names so multiple deployments (or
+      other stacks) never collide. Use lowercase letters, numbers, and hyphens.
+    AllowedPattern: '^[a-z0-9-]+$'
+
+  EnvironmentName:
+    Type: String
+    Default: prod
+    Description: Environment name (e.g. dev, staging, prod). Used in resource names and alert subjects.
+    AllowedPattern: '^[a-z0-9-]+$'
+
+  OpenSearchEndpoint:
+    Type: String
+    Description: >
+      Your OpenSearch endpoint (managed domain or Serverless collection), e.g.
+      search-my-domain-xxxx.us-east-1.es.amazonaws.com. The forwarder indexes
+      events here. Bring your own — this template does not provision OpenSearch.
+
+  OpenSearchResourceArn:
+    Type: String
+    Description: >
+      ARN used to scope the forwarder's IAM permissions. For a managed domain:
+      arn:aws:es:REGION:ACCOUNT:domain/NAME/*. For Serverless:
+      arn:aws:aoss:REGION:ACCOUNT:collection/COLLECTION_ID.
+
+  OpenSearchServiceName:
+    Type: String
+    Default: es
+    AllowedValues: [es, aoss]
+    Description: >
+      SigV4 signing service. "es" for a managed OpenSearch/Elasticsearch domain,
+      "aoss" for an OpenSearch Serverless collection.
+
+  OpenSearchRegion:
+    Type: String
+    Default: ''
+    Description: >
+      Region to sign OpenSearch requests for. Leave blank to use the region this
+      stack is deployed in. Set this if your OpenSearch endpoint lives in a
+      different region than this stack.
+
+  OpenSearchIndex:
+    Type: String
+    Description: OpenSearch index name events are written to (auto-created on first write).
+    AllowedPattern: '^[a-z0-9][a-z0-9._-]*$'
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: >
+      Optional. An email address to subscribe to the alerts SNS topic. Leave
+      blank to wire up subscriptions yourself after deployment.
+
+Conditions:
+  IsManagedDomain: !Equals [!Ref OpenSearchServiceName, 'es']
+  HasRegionOverride: !Not [!Equals [!Ref OpenSearchRegion, '']]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Tracing: Active
+    MemorySize: 1024
+    Timeout: 60
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # 1. Central event bus — all producers publish here.
+  # ---------------------------------------------------------------------------
+  PlatformEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${NamePrefix}-events-${EnvironmentName}'
+
+  # ---------------------------------------------------------------------------
+  # 2. Error alerting: EventBridge rule -> SQS (buffer) -> digest Lambda -> SNS.
+  # ---------------------------------------------------------------------------
+  ErrorAlertsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${NamePrefix}-error-alerts-${EnvironmentName}'
+      Description: Route error events to SQS for throttled digest alerts.
+      EventBusName: !Ref PlatformEventBus
+      EventPattern:
+        detail-type:
+          - Error
+          - ProcessingError
+          - IntegrationError
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ErrorAlertsQueue.Arn
+          Id: !Sub '${NamePrefix}-error-alerts-queue-${EnvironmentName}'
+
+  ErrorAlertsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${NamePrefix}-${EnvironmentName}-error-alerts-queue'
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ErrorAlertsDLQ.Arn
+        maxReceiveCount: 3
+
+  ErrorAlertsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${NamePrefix}-${EnvironmentName}-error-alerts-dlq'
+      MessageRetentionPeriod: 1209600
+
+  ErrorAlertsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ErrorAlertsQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ErrorAlertsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt ErrorAlertsRule.Arn
+
+  # ---------------------------------------------------------------------------
+  # 3. SNS alerts topic (subscribe email / Slack / PagerDuty).
+  # ---------------------------------------------------------------------------
+  AlertsSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${NamePrefix}-alerts-${EnvironmentName}'
+      DisplayName: Platform Alerts
+
+  AlertsSnsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertsSnsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertsSnsTopic
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertsSnsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------------------------------------------------------------------------
+  # 4. Alert digest Lambda: batches SQS error events into one SNS notification.
+  #    ReservedConcurrentExecutions=1 + 60s batch window => <= 1 email/minute.
+  # ---------------------------------------------------------------------------
+  AlertDigestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-alert-digest-${EnvironmentName}'
+      Description: Sends a throttled SNS digest of error events buffered in SQS.
+      CodeUri: app/
+      Handler: src.alert_digest.lambda_handler
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          ALERTS_SNS_TOPIC_ARN: !Ref AlertsSnsTopic
+          STAGE: !Ref EnvironmentName
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertsSnsTopic.TopicName
+      Events:
+        ErrorQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ErrorAlertsQueue.Arn
+            BatchSize: 100
+            MaximumBatchingWindowInSeconds: 60
+
+  AlertDigestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefix}-alert-digest-${EnvironmentName}'
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # 5. OpenSearch forwarder: indexes every event on the bus into OpenSearch.
+  # ---------------------------------------------------------------------------
+  OpenSearchForwarderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-opensearch-forwarder-${EnvironmentName}'
+      Description: Forwards EventBridge events to OpenSearch for search and analytics.
+      CodeUri: app/
+      Handler: src.handler.lambda_handler
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
+          OPENSEARCH_REGION: !If [HasRegionOverride, !Ref OpenSearchRegion, !Ref 'AWS::Region']
+          OPENSEARCH_INDEX: !Ref OpenSearchIndex
+          OPENSEARCH_SERVICE: !Ref OpenSearchServiceName
+          APP_ENV: !Ref EnvironmentName
+          POWERTOOLS_SERVICE_NAME: !Sub '${NamePrefix}-forwarder'
+          POWERTOOLS_LOG_LEVEL: INFO
+      Policies:
+        - !If
+          - IsManagedDomain
+          - Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttpGet
+                  - es:ESHttpHead
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                  - es:ESHttpDelete
+                  - es:ESHttpPatch
+                Resource: !Ref OpenSearchResourceArn
+          - Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !Ref OpenSearchResourceArn
+      Events:
+        AllPlatformEvents:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref PlatformEventBus
+            Pattern:
+              account:
+                - !Ref 'AWS::AccountId'
+
+  OpenSearchForwarderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefix}-opensearch-forwarder-${EnvironmentName}'
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # 6. CloudWatch alarms — bus health + forwarder guardrails.
+  # ---------------------------------------------------------------------------
+  EventBusFailedInvocationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-EventBus-FailedInvocations-${EnvironmentName}'
+      AlarmDescription: EventBridge failed invocations exceeds threshold.
+      Namespace: AWS/Events
+      MetricName: FailedInvocations
+      Dimensions:
+        - Name: EventBusName
+          Value: !Ref PlatformEventBus
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsSnsTopic
+      OKActions:
+        - !Ref AlertsSnsTopic
+
+  EventBusThrottledRulesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-EventBus-ThrottledRules-${EnvironmentName}'
+      AlarmDescription: EventBridge rules being throttled.
+      Namespace: AWS/Events
+      MetricName: ThrottledRules
+      Dimensions:
+        - Name: EventBusName
+          Value: !Ref PlatformEventBus
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsSnsTopic
+      OKActions:
+        - !Ref AlertsSnsTopic
+
+  ErrorAlertsDlqDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-ErrorAlerts-DLQ-Depth-${EnvironmentName}'
+      AlarmDescription: Error alerts DLQ has messages — processing failures.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ErrorAlertsDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsSnsTopic
+
+  ForwarderInvocationSpikeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-Forwarder-InvocationSpike-${EnvironmentName}'
+      AlarmDescription: Forwarder invocations exceed 10K in 5 minutes — potential runaway.
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Statistic: Sum
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OpenSearchForwarderFunction
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsSnsTopic
+
+  ForwarderErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-Forwarder-HighErrors-${EnvironmentName}'
+      AlarmDescription: Forwarder error count exceeds threshold.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OpenSearchForwarderFunction
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsSnsTopic
+
+  ForwarderDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-Forwarder-HighDuration-${EnvironmentName}'
+      AlarmDescription: Forwarder p99 duration exceeds 48s (80% of 60s timeout).
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      ExtendedStatistic: p99
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OpenSearchForwarderFunction
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 48000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsSnsTopic
+
+Outputs:
+  EventBusName:
+    Description: Name of the platform event bus — publish your events here.
+    Value: !Ref PlatformEventBus
+
+  EventBusArn:
+    Description: ARN of the platform event bus.
+    Value: !GetAtt PlatformEventBus.Arn
+
+  AlertsSnsTopicArn:
+    Description: SNS topic ARN for alerts — subscribe email / Slack / PagerDuty.
+    Value: !Ref AlertsSnsTopic
+
+  ErrorAlertsQueueArn:
+    Description: Error alerts SQS queue ARN.
+    Value: !GetAtt ErrorAlertsQueue.Arn
+
+  ForwarderFunctionArn:
+    Description: OpenSearch forwarder Lambda ARN.
+    Value: !GetAtt OpenSearchForwarderFunction.Arn
+
+  ForwarderRoleArn:
+    Description: >
+      Forwarder execution role ARN. For OpenSearch Serverless, add this to a
+      data access policy on your collection so the forwarder can write.
+    Value: !GetAtt OpenSearchForwarderFunctionRole.Arn
