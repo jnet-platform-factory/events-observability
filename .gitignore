@@ -1,0 +1,19 @@
+# SAM build artifacts
+.aws-sam/
+packaged.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local env / secrets
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+.history/
+.vscode/
