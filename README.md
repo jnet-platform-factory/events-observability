@@ -1,5 +1,23 @@
 # Serverless Events Observability
 
+> [!IMPORTANT]
+> **This repository is no longer the source of truth.**
+>
+> Development moved to `junctionnet/platform-infrastructure` (private), under
+> `events-observability/`. The Serverless Application Repository application
+> `serverless-events-observability` is built and released from there.
+>
+> **What is in this repository is 1.0.3** — the original, Lambda-only template.
+> It has no Amazon Data Firehose delivery mode and no configurable document
+> shaping. SAR 1.1.0 and later add both, and none of that code is here.
+>
+> The SAR application is shared with specific AWS accounts rather than published
+> publicly. If you are outside those accounts, this is the most recent version
+> available to you — it still works, it is simply not where the work is
+> happening.
+>
+> Last release from this repository: **1.0.3**, 2026-07-05.
+
 Drop-in event observability for EventBridge-based serverless platforms. Deploys
 entirely into **your own AWS account** — nothing is hosted by anyone else.
 
