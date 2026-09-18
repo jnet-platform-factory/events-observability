@@ -13,14 +13,24 @@ Metadata:
       Drop-in event observability for EventBridge-based serverless platforms:
       a central event bus, throttled error-alert digests, and an OpenSearch
       forwarder that indexes every event for search and analytics.
-    Author: CargoNaut
+    Author: JunctionNet
     SpdxLicenseId: Apache-2.0
     LicenseUrl: LICENSE.txt
     ReadmeUrl: README.md
     Labels: ['eventbridge', 'observability', 'opensearch', 'serverless', 'monitoring', 'events']
-    HomePageUrl: https://github.com/platform-factory/events-observability
-    SemanticVersion: 1.0.0
-    SourceCodeUrl: https://github.com/platform-factory/events-observability
+    # The org is `jnet-platform-factory`. `platform-factory` was its old name and
+    # still resolves by redirect, which is why the wrong one survived this long.
+    HomePageUrl: https://github.com/jnet-platform-factory/events-observability
+    # 1.0.3 is what was actually published from this repository, on 2026-07-05.
+    # This said 1.0.0 -- the value it was first published with, never bumped
+    # afterwards -- so the template claimed to be a version three releases old.
+    #
+    # Nothing further will be published from here. Development moved to
+    # junctionnet/platform-infrastructure, under events-observability/, and SAR
+    # 1.1.0 onwards is released from there with Firehose delivery and
+    # configurable document shaping. See README.md.
+    SemanticVersion: 1.0.3
+    SourceCodeUrl: https://github.com/jnet-platform-factory/events-observability
 
 Parameters:
   NamePrefix:
