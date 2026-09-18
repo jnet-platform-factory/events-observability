@@ -4,7 +4,7 @@
 > **This is a published-artifact mirror.**
 >
 > The code here is exactly what Serverless Application Repository version
-> **1.2.0** ships. Development happens in `junctionnet/platform-infrastructure`
+> **1.2.1** ships. Development happens in `junctionnet/platform-infrastructure`
 > under `events-observability/`; this repository is refreshed automatically on
 > release and does not take pull requests.
 >
@@ -111,7 +111,60 @@ Firehose also fixes a real blind spot: a document OpenSearch rejects lands in
 `DeliveryToAmazonOpenSearchService.Success`, which Firehose measures rather than
 this code — so it cannot be swallowed the way the per-event path swallows it.
 
-### Firehose against a cross-account domain takes two deploys
+### Capabilities — and they differ by how you deploy
+
+This template creates IAM roles with **explicit names** and attaches **resource
+policies** (SQS queue policies, an SNS topic policy). Both need acknowledging,
+and the acknowledgement is spelled differently depending on which API you go
+through. Getting it wrong fails the deploy before anything is created.
+
+**Deploying from the Serverless Application Repository** — `serverlessrepo`
+requires `CAPABILITY_RESOURCE_POLICY` and refuses without it:
+
+```bash
+aws serverlessrepo create-cloud-formation-change-set \
+  --application-id <application arn> --semantic-version <version> \
+  --stack-name <your stack name> \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+                 CAPABILITY_AUTO_EXPAND CAPABILITY_RESOURCE_POLICY \
+  --parameter-overrides file://params.json
+```
+
+Omit it and you get, before any resource exists:
+
+```
+Required capabilities [CAPABILITY_RESOURCE_POLICY] were not provided.
+```
+
+**Deploying or updating through CloudFormation directly** — `create-change-set`
+and `sam deploy` **reject** `CAPABILITY_RESOURCE_POLICY`; their enum does not
+contain it:
+
+```bash
+aws cloudformation create-change-set \
+  --stack-name <your stack name> --template-url <url> \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+  --parameters file://params.json
+```
+
+Pass it anyway and you get:
+
+```
+Value '[…, CAPABILITY_RESOURCE_POLICY]' at 'capabilities' failed to satisfy
+constraint: Member must satisfy enum value set:
+[CAPABILITY_AUTO_EXPAND, CAPABILITY_NAMED_IAM, CAPABILITY_IAM]
+```
+
+So the two paths are not interchangeable, and a tenant migrating an existing
+stack will use both: `serverlessrepo` for a fresh deploy, CloudFormation for an
+in-place update of a stack that already exists.
+
+**`CAPABILITY_NAMED_IAM`, not `CAPABILITY_IAM`.** The Firehose delivery role has
+a fixed name on purpose — its ARN is written into an OpenSearch access policy,
+possibly in another account, and a CloudFormation-generated name would silently
+invalidate that grant every time the role is replaced.
+
+## Firehose against a cross-account domain takes two deploys
 
 Firehose verifies at `CreateDeliveryStream` time that its delivery role can reach
 the cluster. But that role is created by this stack, and OpenSearch will not

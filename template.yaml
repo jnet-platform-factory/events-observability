@@ -29,10 +29,10 @@ Metadata:
     # 1.0.0 fails outright. Minor, not major: every new parameter
     # (ShapingConfig, CreateForwardingRule, EventBusName) defaults to the old
     # behaviour, and nothing was removed.
-    # 1.2.0: adds the optional search API. Minor, not major -- CreateSearchApi
-    # defaults to false, so an existing tenant's stack is unchanged by the
-    # upgrade. 1.1.0 remains published and broken; see the note in git history.
-    SemanticVersion: 1.2.0
+    # 1.2.1: documentation only -- the required capabilities differ by
+    # deployment path and were nowhere in the README, so every tenant's first
+    # deploy failed on it.
+    SemanticVersion: 1.2.1
     SourceCodeUrl: https://github.com/junctionnet/platform-infrastructure
 
 Parameters:
