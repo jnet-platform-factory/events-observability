@@ -1,4 +1,5 @@
-from typing import Dict, Any
+"""The service layer. Generic."""
+from typing import Any, Dict
 
 from .domain import AppEventModel
 
@@ -9,5 +10,4 @@ class AppEventsForwarderService:
         self.context = context or {}
 
     def save(self, app_event: AppEventModel) -> AppEventModel:
-        response = self.repository.save_event(app_event)
-        return response
+        return self.repository.save_event(app_event)

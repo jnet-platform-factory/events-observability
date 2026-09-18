@@ -1,12 +1,11 @@
 import json
 import os
-from datetime import datetime, timezone
-
 import boto3
+from datetime import datetime, timezone
 
 sns_client = boto3.client("sns")
 SNS_TOPIC_ARN = os.environ.get("ALERTS_SNS_TOPIC_ARN", "")
-STAGE = os.environ.get("STAGE", "prod")
+ENVIRONMENT_NAME = os.environ.get("ENVIRONMENT_NAME", "dev")
 
 
 def lambda_handler(event, context):
@@ -50,11 +49,11 @@ def lambda_handler(event, context):
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     total_errors = sum(len(v) for v in errors_by_source.values())
 
-    subject = f"[{STAGE.upper()}] {total_errors} error(s) from {len(errors_by_source)} source(s)"
+    subject = f"[{ENVIRONMENT_NAME.upper()}] {total_errors} error(s) from {len(errors_by_source)} source(s)"
 
     lines = [
         f"Error Alert Digest - {timestamp}",
-        f"Environment: {STAGE}",
+        f"Environment: {ENVIRONMENT_NAME}",
         f"Total errors in batch: {total_errors}",
         "",
     ]

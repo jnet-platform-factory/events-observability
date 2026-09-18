@@ -1,177 +1,216 @@
 # Serverless Events Observability
 
-> [!IMPORTANT]
-> **This repository is no longer the source of truth.**
+> [!NOTE]
+> **This is a published-artifact mirror.**
 >
-> Development moved to `junctionnet/platform-infrastructure` (private), under
-> `events-observability/`. The Serverless Application Repository application
-> `serverless-events-observability` is built and released from there.
->
-> **What is in this repository is 1.0.3** — the original, Lambda-only template.
-> It has no Amazon Data Firehose delivery mode and no configurable document
-> shaping. SAR 1.1.0 and later add both, and none of that code is here.
+> The code here is exactly what Serverless Application Repository version
+> **1.1.0** ships. Development happens in `junctionnet/platform-infrastructure`
+> under `events-observability/`; this repository is refreshed per release and
+> does not take pull requests.
 >
 > The SAR application is shared with specific AWS accounts rather than published
-> publicly. If you are outside those accounts, this is the most recent version
-> available to you — it still works, it is simply not where the work is
-> happening.
->
-> Last release from this repository: **1.0.3**, 2026-07-05.
+> publicly. If you are outside those accounts you can read this source, but the
+> application is not deployable by you.
 
-Drop-in event observability for EventBridge-based serverless platforms. Deploys
-entirely into **your own AWS account** — nothing is hosted by anyone else.
+Every event on an EventBridge bus, indexed into OpenSearch and searchable —
+plus a throttled error-alert digest, dead-letter queues and alarms for the paths
+that can fail silently.
 
-One deploy gives you three things:
+Deploys entirely into your own AWS account. Bring your own OpenSearch domain or
+Serverless collection; this stack does not provision one.
 
-1. **A central EventBridge bus** (`<prefix>-events-<env>`) that all your services
-   publish domain events to.
-2. **A throttled error-alert digest** — an EventBridge rule routes error events
-   to SQS, and a Lambda batches them into at most **one SNS notification per
-   minute** (no alert storms).
-3. **An OpenSearch forwarder** — every event on the bus is indexed into your
-   OpenSearch domain or Serverless collection for search, dashboards, and
-   analytics.
-
-Plus CloudWatch alarms for bus health (failed invocations, throttled rules, DLQ
-depth) and forwarder guardrails (invocation spikes, errors, p99 duration).
-
-## Architecture
-
-```
-producers ──put_events──► EventBridge bus ──┬─► rule (Error/*) ─► SQS ─► digest Lambda ─► SNS ─► you
-                                            └─► rule (all)     ─────────► forwarder Lambda ─► OpenSearch
+```yaml
+Resources:
+  EventsObservability:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location:
+        ApplicationId: arn:aws:serverlessrepo:us-east-1:<account>:applications/serverless-events-observability
+        SemanticVersion: 1.1.0
+      Parameters:
+        NamePrefix: acme
+        EnvironmentName: prod
+        OpenSearchEndpoint: search-acme-xxxx.us-east-1.es.amazonaws.com
+        OpenSearchResourceArn: arn:aws:es:us-east-1:111122223333:domain/acme/*
+        OpenSearchIndex: acme-events
 ```
 
-## Prerequisites
+That is a complete deployment. Publish to the bus it creates and documents start
+appearing in the index.
 
-- An existing **OpenSearch domain** or **OpenSearch Serverless collection** in
-  your account. This template does **not** provision OpenSearch — you bring the
-  endpoint. (Auto-provisioning is on the roadmap; it's left out so a one-click
-  deploy never surprises you with a standing OpenSearch bill.)
+## The document, and why its shape is configuration
 
-## Parameters
+Each event becomes one document:
 
-| Parameter | Required | Default | Notes |
-|-----------|----------|---------|-------|
-| `NamePrefix` | no | `events-observability` | Prefix for every resource name. |
-| `EnvironmentName` | no | `prod` | Used in names and alert subjects. |
-| `OpenSearchEndpoint` | **yes** | — | Your domain/collection endpoint. |
-| `OpenSearchResourceArn` | **yes** | — | ARN to scope the forwarder's IAM. Managed: `arn:aws:es:REGION:ACCT:domain/NAME/*`. Serverless: `arn:aws:aoss:REGION:ACCT:collection/ID`. |
-| `OpenSearchServiceName` | no | `es` | `es` for a managed domain, `aoss` for Serverless (sets the SigV4 signing service). |
-| `OpenSearchRegion` | no | stack region | Set if OpenSearch lives in a different region than this stack. |
-| `OpenSearchIndex` | **yes** | — | Index events are written to (lowercase; auto-created on first write). |
-| `AlertEmail` | no | — | Optional email subscribed to the alerts topic. |
-
-## Deploy from the Serverless Application Repository
-
-Find **serverless-events-observability** in the SAR console, set the parameters,
-and deploy — or deploy via CLI:
-
-```bash
-sam deploy \
-  --template-url <SAR-provided-url> \
-  --stack-name events-observability \
-  --capabilities CAPABILITY_IAM \
-  --parameter-overrides \
-    OpenSearchEndpoint=search-my-domain-xxxx.us-east-1.es.amazonaws.com \
-    OpenSearchResourceArn=arn:aws:es:us-east-1:111122223333:domain/my-domain/* \
-    OpenSearchRegion=us-east-1 \
-    OpenSearchIndex=platform-events \
-    AlertEmail=team@example.com
+```json
+{
+  "event_id":    "b4f1…",
+  "source":      "billing.invoice",
+  "event":       "InvoiceIssued",
+  "environment": "prod",
+  "application": "billing",
+  "organization": "acme-corp",
+  "username":    "jdoe",
+  "timestamp":   "2026-09-17T09:12:44.518Z",
+  "payload":     "{\"invoice_id\":\"INV-9\",\"total\":1200}"
+}
 ```
 
-### OpenSearch access — one required post-deploy step
+`payload` is the entire event detail, stored as a **JSON string**. That is
+deliberate: a per-event detail shape cannot be mapped into a rigid index mapping
+without eventually colliding. The cost is that nothing inside `payload` can be
+aggregated or filtered on — so anything you want to query lives at the top level.
 
-The forwarder authenticates to OpenSearch with **AWS SigV4** using its Lambda
-execution role (`ForwarderRoleArn` in the stack outputs). You must let that role
-in:
+Which is what `ShapingConfig` is for:
 
-- **Managed domain:** if the domain has a restrictive access policy, add
-  `ForwarderRoleArn` as a principal allowed `es:ESHttp*` on the domain. (The
-  stack already grants the role the matching IAM permissions.)
-- **Serverless collection:** add `ForwarderRoleArn` to a **data access policy**
-  on the collection granting index/write permissions, and keep
-  `OpenSearchServiceName=aoss`.
-
-## Publishing events
-
-```python
-import boto3, json
-
-boto3.client("events").put_events(Entries=[{
-    "Source": "order.service",
-    "DetailType": "OrderCreated",           # any type => indexed to OpenSearch
-    "Detail": json.dumps({
-        "organization": "acme", "username": "jane@acme.com",
-        "environment": "prod", "application": "orders",
-        "order_id": "12345",
-    }),
-    "EventBusName": "<prefix>-events-<env>",
-}])
+```json
+{
+  "defaults": {"application": "billing"},
+  "promote":  [{"from": "total", "as": "invoice_total", "type": "int"}],
+  "nested":   {"actor": {"user": "username", "org": "organization"}}
+}
 ```
 
-To trigger the **error digest**, use a `DetailType` of `Error`,
-`ProcessingError`, or `IntegrationError` and include an `error` (or `message`)
-field in the detail.
+- **`defaults`** — fallbacks for the four core fields (`environment`,
+  `application`, `organization`, `username`) when an event omits them or sends an
+  empty value.
+- **`promote`** — lift a top-level detail key out into its own document field so
+  it can be summed, filtered and charted. `type` is `int`, `str` or `raw`.
+- **`nested`** — build a composite object out of resolved core fields.
 
-## Outputs
+Anything the config cannot honour exactly fails the cold start with a named
+error. It never falls back to a different shape — see below for why that matters
+more than it sounds.
 
-`EventBusName`, `EventBusArn`, `AlertsSnsTopicArn`, `ErrorAlertsQueueArn`,
-`ForwarderFunctionArn`, `ForwarderRoleArn`.
+### Choose `type` deliberately
 
-## Publishing this app to SAR (maintainers)
+An index with no explicit mapping takes each field's type from **the first
+non-null value it ever sees**, permanently. An emitter that sends `"12"` where it
+once sent `12` maps the field as text, and every aggregation over it fails from
+then on — fixable only by a reindex. Worse, indexing errors on the per-event path
+are swallowed, so a mapping conflict discards the **whole document** and raises
+nothing.
 
-```bash
-cd marketplace/events-observability
-sam build --use-container                 # needs Docker (builds pydantic-core wheels)
-sam package --s3-bucket <your-sar-artifact-bucket> --output-template-file packaged.yaml
-sam publish --template packaged.yaml --region <region>
-# then, in the SAR console, mark the application public (or share with specific accounts)
+`"type": "int"` coerces what is unambiguously an integer and drops everything
+else — including booleans, which are integers in Python and never a real count.
+The coercers exist so that a careless emitter cannot decide your mapping.
+
+## Delivery modes
+
+`DeliveryMode=Lambda` (default) invokes the forwarder once per event, which
+indexes one document per invocation. Simple, and fine at low volume.
+
+`DeliveryMode=Firehose` points the rule at an Amazon Data Firehose stream.
+Firehose buffers records, calls the same function as a *transformation* (a batch
+in, shaped documents out), then bulk-indexes — and owns retry plus backup of
+rejected documents to S3. At volume this is the difference between N HTTP round
+trips and one `_bulk`.
+
+Firehose also fixes a real blind spot: a document OpenSearch rejects lands in
+`failed/<env>/` in the backup bucket and moves
+`DeliveryToAmazonOpenSearchService.Success`, which Firehose measures rather than
+this code — so it cannot be swallowed the way the per-event path swallows it.
+
+### Firehose against a cross-account domain takes two deploys
+
+Firehose verifies at `CreateDeliveryStream` time that its delivery role can reach
+the cluster. But that role is created by this stack, and OpenSearch will not
+accept a principal ARN that does not exist yet. One deploy cannot do both.
+
+1. Deploy with `FirehoseStreamEnabled=false`. Creates the role, the bucket and
+   the log group, and nothing that talks to OpenSearch.
+2. Take `FirehoseDeliveryRoleArn` from the outputs and add it to the domain's
+   access policy.
+3. Deploy again with `FirehoseStreamEnabled=true`. A successful
+   `CreateDeliveryStream` **is** the proof that step 2 worked.
+
+Two things about that grant, both of which cost someone a day to find:
+
+- **Firehose signs as its own delivery role, not the forwarder's execution
+  role.** Granting the Lambda role is not enough.
+- **The read half is not optional, and it needs the bare domain root** —
+  `…:domain/name` with no trailing `/*`, which the `/*` wildcard does not match —
+  plus `_all/_settings`, `_cluster/stats`, `_nodes*`, `_stats` and
+  `<index>*/_mapping`. Firehose probes the cluster before delivering. Omitting
+  the root is what produces the misleading *"Verify that the IAM role has access
+  to the Elasticsearch cluster endpoint"*.
+
+`ClusterEndpoint` is used as given and must resolve in **your** account — a
+cross-account domain cannot be addressed by `DomainARN`.
+
+### Latency under Firehose is about 2× the buffer interval
+
+`FirehoseBufferIntervalSeconds` applies to **both** of the stream's buffers,
+which sit in series: the processing buffer before the transform and the delivery
+buffer before the bulk write. Measured end to end: 105s at 60, 41.8s at 30. Set
+it with that doubling in mind if anything reads the index interactively.
+
+## Bringing your own bus, or your own rule
+
+Both are parameters, because in a mature account neither is usually yours to
+create:
+
+- **`EventBusName`** — blank creates a bus named
+  `<NamePrefix>-events-<EnvironmentName>`; set it and the stack attaches to an
+  existing bus and creates nothing. Two IaC tools owning one bus is how a
+  rollback destroys a resource the other tool believes it manages.
+- **`CreateForwardingRule`** — `true` creates a rule matching every event in the
+  account. Set it `false` when the filtering is yours — a source allowlist, a
+  detail-type filter, or a rule that already exists and must keep its name — and
+  point your own rule at the `ForwarderFunctionArn` or `DeliveryStreamArn`
+  output. Filtering at the rule is also the cheapest place to filter: an event
+  that never matches is never delivered and never billed.
+
+  A Firehose target needs `EventsToFirehoseRoleArn` as the target's `RoleArn` —
+  unlike a Lambda target, there is no resource policy to attach on the Firehose
+  side.
+
+  Set it `false` and forget to create a rule and nothing is forwarded. Set it
+  `true` alongside an existing rule and every event is indexed twice.
+
+## OpenSearch Serverless
+
+Set `OpenSearchServiceName=aoss` and point `OpenSearchResourceArn` at the
+collection. Add `ForwarderRoleArn` to a data access policy on the collection.
+
+Firehose mode requires `es` — Firehose reaches a Serverless collection through a
+different destination block, which is not wired up here. Use Lambda mode for
+`aoss`.
+
+## Verifying a deployment
+
+The surface is **EventBridge in, an OpenSearch document out**. Not the Lambda,
+not the template. Publish to the bus, then read the index.
+
+Under Firehose, the reconciliation invariant is:
+
+```
+IncomingRecords == DeliveryToAmazonOpenSearchService.Records
+                 + <objects under failed/<env>/ in the backup bucket>
+                 + <delivery DLQ depth>
 ```
 
-### Using the Makefile
+`IncomingRecords` is published before the delivered-records metric for the same
+batch, so a check run immediately after publishing shows a transient gap of
+exactly the batch size. Poll until they converge before calling it a leak.
 
-A [Makefile](Makefile) wraps every step. Run `make` (or `make help`) to list
-targets and see the current variable values.
+Worth probing explicitly, because they are the easy things to get wrong: an event
+whose source your rule does not match, an event missing a field your config
+promotes, and the same event published twice (you get two documents — re-ingestion
+is not deduplicated).
 
-```bash
-cd marketplace/events-observability
+## Alarms
 
-# One-time: create the artifact bucket and grant SAR read access
-make create-bucket S3_BUCKET=my-sar-artifacts
+On the bus: `FailedInvocations`, `ThrottledRules`. On the forwarder: errors,
+duration, and an invocation spike. On the error path: DLQ depth. Under Firehose:
+`DeliveryToAmazonOpenSearchService.Success` **and** `.DataFreshness` — a stalled
+stream reports no failures at all, so `Success` alone would never fire.
 
-# Do everything: validate -> build -> package -> publish
-make release S3_BUCKET=my-sar-artifacts
-```
+All of them publish to the `AlertsSnsTopicArn` output. **Subscribe something to
+it.** An SNS topic with no subscriptions accepts every publish and reports
+success, and `describe-alarm-history` will say "Successfully executed action"
+while nobody is told anything.
 
-| Target | Description |
-|--------|-------------|
-| `make help` | List targets and show current vars (default target). |
-| `make validate` | Lint & validate the SAM template. |
-| `make build` | `sam build --use-container` (needs Docker). |
-| `make create-bucket S3_BUCKET=…` | Create the SAR artifact bucket and attach the `serverlessrepo` read policy. |
-| `make package S3_BUCKET=…` | Upload code artifacts and emit `packaged.yaml`. |
-| `make publish` | Publish `packaged.yaml` to SAR. |
-| `make release S3_BUCKET=…` | Full pipeline: validate → build → package → publish. |
-| `make deploy` | Guided deploy into your own account for testing. |
-| `make outputs` | Show deployed stack outputs. |
-| `make logs-forwarder` / `make logs-digest` | Tail the forwarder / alert-digest logs. |
-| `make destroy` | Delete the test stack. |
-| `make clean` | Remove build artifacts (`.aws-sam`, `packaged.yaml`). |
+## Licence
 
-**Variables** (override on the command line, e.g. `make release S3_BUCKET=… REGION=us-west-1`):
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `S3_BUCKET` | _(required for package/publish)_ | SAR artifact bucket. |
-| `REGION` | `us-east-1` | Target AWS region. |
-| `STACK_NAME` | `events-observability` | Stack name for test deploys. |
-| `AWS_VAULT` | _(unset)_ | If set, wraps every command in `aws-vault exec <profile> --`. Otherwise export `AWS_PROFILE`. |
-
-> **Bump `SemanticVersion`** in [template.yaml](template.yaml) before each new
-> `make publish` — SAR rejects re-publishing the same version.
-
-
-## License
-
-Apache-2.0. See [LICENSE.txt](LICENSE.txt).
+Apache-2.0.

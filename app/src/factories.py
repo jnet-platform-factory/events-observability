@@ -1,17 +1,35 @@
+"""Wiring. Reads the environment once, builds the delivery side.
+
+This is the asymmetric half of the seam: `factories` imports `repositories`,
+which imports `opensearch-py` and `boto3`. `shaping` imports none of them, which
+is what lets the shaping tests run — and the field maps be validated — without a
+delivery dependency installed. See `tests/test_shaping_standalone.py`.
+"""
 import os
+from functools import lru_cache
 from typing import Any, Dict
 
-from aws_lambda_powertools.utilities.data_classes import EventBridgeEvent
-
 from .application import AppEventsForwarderService
-from .domain import AppEventModel
 from .repositories import OpenSearchAppEventsRepository
+from .shaping import load_config
 
 OPENSEARCH_ENDPOINT = os.getenv("OPENSEARCH_ENDPOINT")
 OPENSEARCH_REGION = os.getenv("OPENSEARCH_REGION", "us-east-1")
 OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX", "platform-events")
-# "es" for a managed OpenSearch domain, "aoss" for OpenSearch Serverless.
 OPENSEARCH_SERVICE = os.getenv("OPENSEARCH_SERVICE", "es")
+
+
+@lru_cache(maxsize=1)
+def shaping_config() -> Dict[str, Any]:
+    """The tenant's field map, parsed once per execution environment.
+
+    Deliberately not lazy about failing: `load_config` raises on anything it
+    cannot honour exactly, and that exception is allowed to escape. A cold start
+    that dies with a named config error is recoverable in a way that a silently
+    differently-shaped document is not — the latter decides an index mapping
+    permanently.
+    """
+    return load_config(os.getenv("SHAPING_CONFIG"))
 
 
 class ServiceFactory:
@@ -24,22 +42,3 @@ class ServiceFactory:
             service=OPENSEARCH_SERVICE,
         )
         return AppEventsForwarderService(repository=repository, context=context)
-
-    @staticmethod
-    def create_app_event_entity(event: EventBridgeEvent) -> AppEventModel:
-        detail = event.detail
-
-        app_event = AppEventModel(
-            environment=detail.get("environment", "unknown"),
-            organization_user_context={
-                "username": detail.get("username") or "default_user",
-                "organization": detail.get("organization") or "default_org",
-            },
-            application=detail.get("application", "unknown"),
-            organization=detail.get("organization") or "default_org",
-            username=detail.get("username") or "default_user",
-            source=event.source,
-            event=event.detail_type,
-            payload=detail,  # the entire detail object as payload
-        )
-        return app_event

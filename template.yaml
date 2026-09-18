@@ -9,28 +9,28 @@ Description: >
 Metadata:
   AWS::ServerlessRepo::Application:
     Name: serverless-events-observability
+    # SAR caps this at 256 characters, counted after YAML folds the block into
+    # one line. `sam publish` rejects a longer one outright -- and does so after
+    # build and package, so an over-long description costs a full CI run.
     Description: >
-      Drop-in event observability for EventBridge-based serverless platforms:
-      a central event bus, throttled error-alert digests, and an OpenSearch
-      forwarder that indexes every event for search and analytics.
+      Drop-in event observability for EventBridge: throttled error-alert digests
+      and an OpenSearch forwarder that indexes every event, per-event or batched
+      through Firehose. The document shape is configuration, so one artifact
+      serves every tenant.
     Author: JunctionNet
     SpdxLicenseId: Apache-2.0
     LicenseUrl: LICENSE.txt
     ReadmeUrl: README.md
-    Labels: ['eventbridge', 'observability', 'opensearch', 'serverless', 'monitoring', 'events']
-    # The org is `jnet-platform-factory`. `platform-factory` was its old name and
-    # still resolves by redirect, which is why the wrong one survived this long.
-    HomePageUrl: https://github.com/jnet-platform-factory/events-observability
-    # 1.0.3 is what was actually published from this repository, on 2026-07-05.
-    # This said 1.0.0 -- the value it was first published with, never bumped
-    # afterwards -- so the template claimed to be a version three releases old.
-    #
-    # Nothing further will be published from here. Development moved to
-    # junctionnet/platform-infrastructure, under events-observability/, and SAR
-    # 1.1.0 onwards is released from there with Firehose delivery and
-    # configurable document shaping. See README.md.
-    SemanticVersion: 1.0.3
-    SourceCodeUrl: https://github.com/jnet-platform-factory/events-observability
+    Labels: ['eventbridge', 'observability', 'opensearch', 'firehose', 'serverless', 'events']
+    HomePageUrl: https://github.com/junctionnet/platform-infrastructure
+    # 1.0.0-1.0.3 already exist, published 2026-07-05 from
+    # platform-factory/events-observability -- the Lambda-only original this
+    # descends from. A published SemanticVersion is immutable, so republishing
+    # 1.0.0 fails outright. Minor, not major: every new parameter
+    # (ShapingConfig, CreateForwardingRule, EventBusName) defaults to the old
+    # behaviour, and nothing was removed.
+    SemanticVersion: 1.1.0
+    SourceCodeUrl: https://github.com/junctionnet/platform-infrastructure
 
 Parameters:
   NamePrefix:
@@ -89,24 +89,230 @@ Parameters:
       Optional. An email address to subscribe to the alerts SNS topic. Leave
       blank to wire up subscriptions yourself after deployment.
 
+  EventBusName:
+    Type: String
+    Default: ''
+    Description: >
+      The EventBridge bus this pipeline listens on.
+
+      Leave blank and the stack creates one named
+      `<NamePrefix>-events-<EnvironmentName>` and owns it. Right for a new
+      deployment — publish your events there and everything else follows.
+
+      Set it to an existing bus name and the stack attaches to that bus and
+      creates nothing. Use this when the bus is owned elsewhere: by Terraform, by
+      another CloudFormation stack, or by a platform team. Two IaC tools owning
+      one bus is the failure this avoids — a rollback or a stack delete would
+      otherwise destroy a resource the other tool believes it manages.
+
+      "default" is a valid value, but a dedicated bus is worth having: rules on
+      the default bus compete with every AWS service event in the account.
+
+  ShapingConfig:
+    Type: String
+    Default: ''
+    MaxLength: 4000
+    Description: >
+      The tenant field map: how an EventBridge `detail` becomes an OpenSearch
+      document. JSON, minified. Leave blank for the generic shape — source,
+      detail-type, the whole detail as `payload`, and the four core fields
+      environment / application / organization / username with default fallbacks.
+
+      Three optional keys:
+
+        defaults  per-core-field fallback, used when the detail omits the key or
+                  carries an empty value.
+        promote   lift a top-level detail key out as its own document field, so
+                  it can be aggregated. `payload` is stored as a JSON *string*,
+                  so nothing inside it can be summed or filtered on — a promotion
+                  is the only way to make a value queryable. Each entry is
+                  {"from": ..., "as": ..., "type": "int"|"str"|"raw"}.
+        nested    build a composite object from already-resolved core fields.
+
+      Example:
+
+        {"defaults":{"application":"MyApp"},
+         "promote":[{"from":"num_pages","as":"num_pages","type":"int"}]}
+
+      **Choose `type` deliberately, and prefer int or str over raw.** An index
+      with no explicit mapping takes each field's type from the first non-null
+      value it ever sees, permanently. An emitter that sends "12" where it once
+      sent 12 will map the field as text and break every aggregation over it,
+      fixable only by a reindex — and because indexing errors are swallowed, it
+      breaks silently, discarding whole documents. The coercers exist to stop an
+      emitter deciding your mapping by accident.
+
+      Anything this parameter cannot honour exactly fails the cold start with a
+      named error rather than quietly shaping a different document.
+
+  CreateForwardingRule:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Whether this stack creates the EventBridge rule that feeds the forwarder.
+
+      "true" (default): a rule matching every event in this account on the bus is
+      created for you. Right for a new deployment.
+
+      "false": the stack creates the forwarder, the stream, the alarms and the
+      roles, but no rule — you point your own rule at the `ForwarderFunctionArn`
+      or `DeliveryStreamArn` output. Use this when the filtering is yours: a
+      source allowlist, a detail-type filter, or a rule that already exists in
+      another stack and must keep its name. Filtering at the rule is also the
+      cheapest place to do it, since an event that never matches is never
+      delivered and never billed.
+
+      Set it false and forget the rule and nothing is forwarded. Set it true
+      alongside an existing rule and every event is indexed twice.
+
+  DeliveryMode:
+    Type: String
+    Default: Lambda
+    AllowedValues: [Lambda, Firehose]
+    Description: >
+      How events get from the bus into OpenSearch.
+
+      "Lambda": an EventBridge rule invokes the forwarder once per event and the
+      function indexes that one document itself. No extra infrastructure, but it
+      is one invocation and one single-document index call per event, and retry
+      / failure handling is whatever the function implements.
+
+      "Firehose": the rule targets an Amazon Data Firehose stream. Firehose
+      buffers records, invokes the forwarder as a data *transformation* (a batch
+      of raw EventBridge envelopes in, shaped documents out), then bulk-indexes
+      the result. Firehose owns buffering, bulk delivery, retry and backup of
+      failed documents to S3. Costs an S3 bucket, a stream and two IAM roles.
+
+      Firehose mode requires OpenSearchServiceName=es. Firehose reaches a
+      Serverless collection through a different destination block that is not
+      wired up here — use Lambda mode for aoss.
+
+  FirehoseBufferSizeMBs:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: >
+      Firehose mode only. Buffer this many MB of records before bulk-indexing.
+      Whichever of size/interval is reached first wins. AWS suggests roughly ten
+      seconds' worth of ingest.
+
+  FirehoseBufferIntervalSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 0
+    MaxValue: 900
+    Description: >
+      Firehose mode only. Flush after this many seconds even if
+      FirehoseBufferSizeMBs has not been reached. Raise it to batch harder,
+      lower it to see events sooner.
+
+      Applied to BOTH of the stream's buffers, which sit in series: the
+      processing buffer that accumulates records before the transform runs, and
+      the delivery buffer that accumulates shaped documents before the bulk
+      write. So worst-case time from put_events to a searchable document is
+      about TWICE this value, not one times it. Setting only the delivery
+      buffer — the more obvious half — buys half the improvement, because
+      records still wait out the processing buffer first.
+
+  FirehoseIndexRotationPeriod:
+    Type: String
+    Default: NoRotation
+    AllowedValues: [NoRotation, OneHour, OneDay, OneWeek, OneMonth]
+    Description: >
+      Firehose mode only. Appending a period to the index name is how you expire
+      old data without a delete-by-query. Defaults to NoRotation because that is
+      what the Lambda path did: rotation changes the index name (index-YYYY-MM-DD),
+      so anything querying the bare OpenSearchIndex name needs a wildcard first.
+
+  FirehoseStreamEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Firehose mode only, and the answer to a chicken-and-egg problem: Firehose
+      verifies that its delivery role can actually reach the cluster at
+      CreateDeliveryStream time, and refuses with "Verify that the IAM role has
+      access to the Elasticsearch cluster endpoint" otherwise. But the role it
+      needs granted is created by this very stack, and OpenSearch will not
+      accept a principal ARN that does not exist yet. One deploy cannot do both.
+
+      So if the domain has a restrictive access policy — which every
+      cross-account domain does — deploy twice:
+
+        1. FirehoseStreamEnabled=false. Creates the delivery role, the
+           failed-document bucket and the log group, and nothing that talks to
+           OpenSearch. Take FirehoseDeliveryRoleArn from the outputs and add it
+           to the domain's access policy.
+        2. FirehoseStreamEnabled=true (the default). Creates the stream and
+           switches the rule over to it.
+
+      Leave it at true when the delivery role can already reach the domain — a
+      same-account domain with a permissive policy, or a repeat deploy.
+
+  FailedDocumentRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    Description: >
+      Firehose mode only. Days to keep documents in the failed-document S3
+      bucket before lifecycle expiry. These are events OpenSearch rejected, kept
+      so they can be inspected and replayed.
+
 Conditions:
   IsManagedDomain: !Equals [!Ref OpenSearchServiceName, 'es']
   HasRegionOverride: !Not [!Equals [!Ref OpenSearchRegion, '']]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  IsFirehoseDelivery: !Equals [!Ref DeliveryMode, 'Firehose']
+  CreateEventBus: !Equals [!Ref EventBusName, '']
+  # Phase 2 of the two-step Firehose rollout — see FirehoseStreamEnabled. The
+  # role, bucket and log group come up in phase 1 under IsFirehoseDelivery; only
+  # the resources that touch OpenSearch wait for this.
+  CreateFirehoseStream: !And
+    - !Equals [!Ref DeliveryMode, 'Firehose']
+    - !Equals [!Ref FirehoseStreamEnabled, 'true']
+
+  # The two rules are mutually exclusive by construction, so no event can be
+  # indexed twice, and both disappear when the tenant owns the rule itself.
+  CreateLambdaRule: !And
+    - !Equals [!Ref DeliveryMode, 'Lambda']
+    - !Equals [!Ref CreateForwardingRule, 'true']
+
+  CreateFirehoseRule: !And
+    - !Equals [!Ref DeliveryMode, 'Firehose']
+    - !Equals [!Ref FirehoseStreamEnabled, 'true']
+    - !Equals [!Ref CreateForwardingRule, 'true']
 
 Globals:
   Function:
-    Runtime: python3.12
+    # This app's dependencies include compiled extensions (pydantic-core, via
+    # aws-lambda-powertools[all]), which are built per Python version. samconfig
+    # sets use_container so the build always matches this runtime rather than
+    # whatever interpreter happens to be on PATH — a mismatch ImportErrors at
+    # cold start, not at build time.
+    Runtime: python3.13
     Tracing: Active
     MemorySize: 1024
     Timeout: 60
 
 Resources:
   # ---------------------------------------------------------------------------
-  # 1. Central event bus — all producers publish here.
+  # 1. The event bus — created here, or attached to.
+  #
+  # Created only when EventBusName is blank. When a bus name is supplied this
+  # stack declares nothing and every rule below simply names it, because two IaC
+  # tools owning one bus means a CloudFormation rollback or stack delete can
+  # destroy a resource the other tool believes it manages. That is not
+  # hypothetical: VIA moved bus ownership to Terraform by retain-then-import
+  # precisely so the physical bus was never recreated and its ARN never changed.
+  #
+  # `BusName` below is the single expression every other resource uses, so the
+  # two cases stay indistinguishable downstream.
   # ---------------------------------------------------------------------------
   PlatformEventBus:
     Type: AWS::Events::EventBus
+    Condition: CreateEventBus
     Properties:
       Name: !Sub '${NamePrefix}-events-${EnvironmentName}'
 
@@ -118,7 +324,7 @@ Resources:
     Properties:
       Name: !Sub '${NamePrefix}-error-alerts-${EnvironmentName}'
       Description: Route error events to SQS for throttled digest alerts.
-      EventBusName: !Ref PlatformEventBus
+      EventBusName: !If [CreateEventBus, !Sub '${NamePrefix}-events-${EnvironmentName}', !Ref EventBusName]
       EventPattern:
         detail-type:
           - Error
@@ -208,7 +414,7 @@ Resources:
       Environment:
         Variables:
           ALERTS_SNS_TOPIC_ARN: !Ref AlertsSnsTopic
-          STAGE: !Ref EnvironmentName
+          ENVIRONMENT_NAME: !Ref EnvironmentName
       Policies:
         - SNSPublishMessagePolicy:
             TopicName: !GetAtt AlertsSnsTopic.TopicName
@@ -227,14 +433,41 @@ Resources:
       RetentionInDays: 30
 
   # ---------------------------------------------------------------------------
-  # 5. OpenSearch forwarder: indexes every event on the bus into OpenSearch.
+  # 5. OpenSearch forwarder: gets every event on the bus into OpenSearch.
+  #
+  # One function, two jobs, chosen by DeliveryMode:
+  #
+  #   Lambda   -> rule invokes it per event; it indexes the document itself
+  #               (handler: src.handler.lambda_handler)
+  #   Firehose -> Firehose invokes it per BATCH as a transformation; it only
+  #               shapes documents and Firehose does the indexing
+  #               (handler: src.handler.firehose_transform)
+  #
+  # The es:ESHttp* grant below stays in both modes even though the transform
+  # never calls OpenSearch. It is what makes DeliveryMode reversible: revert the
+  # parameter and the Lambda path works again without a permissions change. The
+  # actions are identical to the ones the Firehose delivery role needs anyway.
   # ---------------------------------------------------------------------------
   OpenSearchForwarderFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub '${NamePrefix}-opensearch-forwarder-${EnvironmentName}'
-      Description: Forwards EventBridge events to OpenSearch for search and analytics.
+      Description: !If
+        - IsFirehoseDelivery
+        - Shapes batches of EventBridge events for Firehose to bulk-index into OpenSearch.
+        - Forwards EventBridge events to OpenSearch for search and analytics.
       CodeUri: app/
+      # ONE handler, whatever DeliveryMode says. `lambda_handler` sniffs the
+      # payload — `deliveryStreamArn` + `records` together appear in nothing
+      # EventBridge sends — and dispatches to the per-event or per-batch path.
+      #
+      # Selecting the Handler from DeliveryMode instead looks tidier and loses
+      # events. Where the rule lives in another stack (CreateForwardingRule=false)
+      # the two deploy separately, so either order leaves a window in which the
+      # rule still invokes per-event while the Handler already expects Firehose
+      # records; everything arriving in that window raises, exhausts the rule's
+      # retries and is gone. One entry point has no such window, and makes the
+      # two stacks order-independent.
       Handler: src.handler.lambda_handler
       Environment:
         Variables:
@@ -242,6 +475,7 @@ Resources:
           OPENSEARCH_REGION: !If [HasRegionOverride, !Ref OpenSearchRegion, !Ref 'AWS::Region']
           OPENSEARCH_INDEX: !Ref OpenSearchIndex
           OPENSEARCH_SERVICE: !Ref OpenSearchServiceName
+          SHAPING_CONFIG: !Ref ShapingConfig
           APP_ENV: !Ref EnvironmentName
           POWERTOOLS_SERVICE_NAME: !Sub '${NamePrefix}-forwarder'
           POWERTOOLS_LOG_LEVEL: INFO
@@ -264,20 +498,335 @@ Resources:
               - Effect: Allow
                 Action: aoss:APIAccessAll
                 Resource: !Ref OpenSearchResourceArn
-      Events:
-        AllPlatformEvents:
-          Type: EventBridgeRule
-          Properties:
-            EventBusName: !Ref PlatformEventBus
-            Pattern:
-              account:
-                - !Ref 'AWS::AccountId'
+
+  # The per-event rule, declared by hand rather than through SAM's `Events`
+  # shorthand: that shorthand cannot be wrapped in Fn::If, and this rule must
+  # not exist in Firehose mode or every event would be indexed twice — once by
+  # this rule and once through the stream. These are the same two resources SAM
+  # generated before, with a deterministic name instead of a hashed one.
+  AllPlatformEventsToForwarderRule:
+    Type: AWS::Events::Rule
+    Condition: CreateLambdaRule
+    Properties:
+      Name: !Sub '${NamePrefix}-opensearch-forwarder-${EnvironmentName}'
+      Description: Route every event on the bus to the forwarder Lambda.
+      EventBusName: !If [CreateEventBus, !Sub '${NamePrefix}-events-${EnvironmentName}', !Ref EventBusName]
+      EventPattern:
+        account:
+          - !Ref 'AWS::AccountId'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OpenSearchForwarderFunction.Arn
+          Id: !Sub '${NamePrefix}-opensearch-forwarder-${EnvironmentName}'
+
+  ForwarderInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateLambdaRule
+    Properties:
+      FunctionName: !GetAtt OpenSearchForwarderFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AllPlatformEventsToForwarderRule.Arn
 
   OpenSearchForwarderLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub '/aws/lambda/${NamePrefix}-opensearch-forwarder-${EnvironmentName}'
       RetentionInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # 5b. Firehose delivery path (DeliveryMode=Firehose only).
+  #
+  #   bus --rule--> Firehose stream --transform--> forwarder Lambda
+  #                       |                              |
+  #                       +--- bulk index ---> OpenSearch (cross-account OK)
+  #                       +--- FailedDocumentsOnly ---> S3
+  #
+  # Cross-account note, and the reason ClusterEndpoint is used below rather than
+  # DomainARN: Firehose resolves DomainARN inside the stream's own account. When
+  # the domain lives in another account it cannot be named that way, and AWS
+  # requires ClusterEndpoint instead. That also means the domain's own access
+  # policy, in the owning account, must name FirehoseDeliveryRole as a principal
+  # -- see the FirehoseDeliveryRoleArn output.
+  # ---------------------------------------------------------------------------
+  FailedDocumentBucket:
+    Type: AWS::S3::Bucket
+    Condition: IsFirehoseDelivery
+    # Retained on stack delete: these are events OpenSearch rejected, which is
+    # exactly the data you want to still have after a bad deploy is rolled back.
+    #
+    # The cost of that: Retain also applies to a rollback of the deploy that
+    # FIRST created the bucket, so a failed initial deploy leaves the (empty)
+    # bucket behind as DELETE_SKIPPED. The next attempt then fails early with
+    # AWS::EarlyValidation::ResourceExistenceCheck, because the bucket already
+    # exists and is no longer stack-managed. Delete the empty bucket by hand and
+    # redeploy. Keeping the data is worth the one-time cleanup; losing rejected
+    # documents to an unrelated rollback would not be.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${NamePrefix}-events-failed-${EnvironmentName}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireFailedDocuments
+            Status: Enabled
+            ExpirationInDays: !Ref FailedDocumentRetentionDays
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsFirehoseDelivery
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${NamePrefix}-events-${EnvironmentName}'
+      RetentionInDays: 30
+
+  # Firehose writes its own delivery errors here. Without these two streams the
+  # CloudWatchLoggingOptions below silently log nothing, and a rejected bulk
+  # request leaves no explanation anywhere.
+  FirehoseOpenSearchLogStream:
+    Type: AWS::Logs::LogStream
+    Condition: IsFirehoseDelivery
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: OpenSearchDelivery
+
+  FirehoseS3LogStream:
+    Type: AWS::Logs::LogStream
+    Condition: IsFirehoseDelivery
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: S3Delivery
+
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Condition: IsFirehoseDelivery
+    Properties:
+      RoleName: !Sub '${NamePrefix}-firehose-delivery-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            # Confused-deputy guard: without it any Firehose stream in any
+            # account could ask to assume this role.
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: !Sub '${NamePrefix}-firehose-delivery-${EnvironmentName}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Index the documents. Firehose also probes the cluster before
+              # delivering, which is why the read verbs are here too.
+              - Sid: OpenSearchDelivery
+                Effect: Allow
+                Action:
+                  - es:ESHttpGet
+                  - es:ESHttpHead
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                Resource:
+                  - !Ref OpenSearchResourceArn
+              - Sid: OpenSearchDescribe
+                Effect: Allow
+                Action:
+                  - es:DescribeDomain
+                  - es:DescribeDomains
+                  - es:DescribeDomainConfig
+                Resource:
+                  - !Ref OpenSearchResourceArn
+              - Sid: FailedDocumentBackup
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt FailedDocumentBucket.Arn
+                  - !Sub '${FailedDocumentBucket.Arn}/*'
+              - Sid: InvokeTransform
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource:
+                  - !GetAtt OpenSearchForwarderFunction.Arn
+                  - !Sub '${OpenSearchForwarderFunction.Arn}:*'
+              - Sid: DeliveryLogging
+                Effect: Allow
+                Action: logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/${NamePrefix}-events-${EnvironmentName}:log-stream:*'
+
+  EventDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Condition: CreateFirehoseStream
+    Properties:
+      DeliveryStreamName: !Sub '${NamePrefix}-events-${EnvironmentName}'
+      DeliveryStreamType: DirectPut
+      AmazonopensearchserviceDestinationConfiguration:
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        # Not DomainARN — see the cross-account note above. The parameter is a
+        # bare hostname; ClusterEndpoint must carry the scheme.
+        ClusterEndpoint: !Sub 'https://${OpenSearchEndpoint}'
+        IndexName: !Ref OpenSearchIndex
+        IndexRotationPeriod: !Ref FirehoseIndexRotationPeriod
+        BufferingHints:
+          SizeInMBs: !Ref FirehoseBufferSizeMBs
+          IntervalInSeconds: !Ref FirehoseBufferIntervalSeconds
+        RetryOptions:
+          DurationInSeconds: 300
+        # FIREHOSE_DEFAULT makes the document id stable across delivery
+        # attempts, so a retried batch overwrites its documents instead of
+        # duplicating them. NO_DOCUMENT_ID indexes faster but every retry
+        # re-inserts, which is how you end up counting the same event twice.
+        DocumentIdOptions:
+          DefaultDocumentIdFormat: FIREHOSE_DEFAULT
+        S3BackupMode: FailedDocumentsOnly
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt OpenSearchForwarderFunction.Arn
+                - ParameterName: NumberOfRetries
+                  ParameterValue: '3'
+                # The processing buffer, which Firehose otherwise defaults to
+                # 60s regardless of the delivery BufferingHints below. Left at
+                # the default it becomes the floor on latency and makes lowering
+                # the delivery interval look like it did nothing.
+                # Sub, not Ref: ParameterValue is typed String.
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: !Sub '${FirehoseBufferIntervalSeconds}'
+                # Left at Firehose's 1MB default deliberately. A transformation
+                # response is capped at 6MB, and the shaped documents come back
+                # roughly the same size as the envelopes going in, so a bigger
+                # processing batch risks tripping that cap.
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '1'
+        S3Configuration:
+          RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+          BucketARN: !GetAtt FailedDocumentBucket.Arn
+          Prefix: !Sub 'failed/${EnvironmentName}/'
+          ErrorOutputPrefix: !Sub 'errors/${EnvironmentName}/'
+          CompressionFormat: GZIP
+          BufferingHints:
+            SizeInMBs: 5
+            IntervalInSeconds: 300
+          CloudWatchLoggingOptions:
+            Enabled: true
+            LogGroupName: !Ref FirehoseLogGroup
+            LogStreamName: S3Delivery
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: OpenSearchDelivery
+
+  # EventBridge needs its own role to put records into the stream; unlike SQS or
+  # Lambda targets there is no resource policy to attach on the Firehose side.
+  EventsToFirehoseRole:
+    Type: AWS::IAM::Role
+    Condition: CreateFirehoseStream
+    Properties:
+      RoleName: !Sub '${NamePrefix}-events-to-firehose-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+            # Scoped to the account rather than the rule ARN on purpose: naming
+            # the rule here would make the rule depend on the role and the role
+            # depend on the rule.
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: !Sub '${NamePrefix}-events-to-firehose-${EnvironmentName}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt EventDeliveryStream.Arn
+
+  # Events EventBridge could not hand to Firehose at all (throttling, stream
+  # deleted, permissions). This is the ingress-side counterpart to the S3
+  # failed-document backup, which only catches documents OpenSearch rejected.
+  EventDeliveryDlq:
+    Type: AWS::SQS::Queue
+    Condition: CreateFirehoseStream
+    Properties:
+      QueueName: !Sub '${NamePrefix}-${EnvironmentName}-event-delivery-dlq'
+      MessageRetentionPeriod: 1209600
+
+  EventDeliveryDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Condition: CreateFirehoseStream
+    Properties:
+      Queues:
+        - !Ref EventDeliveryDlq
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventDeliveryDlq.Arn
+            # Scoped to our own rule when we own it, and to this account's rules
+            # when the tenant owns it — a GetAtt to a rule that may not exist
+            # cannot be used here, and leaving the condition off entirely would
+            # let any EventBridge rule in any account write to this queue.
+            Condition: !If
+              - CreateFirehoseRule
+              - ArnEquals:
+                  aws:SourceArn: !GetAtt AllPlatformEventsToFirehoseRule.Arn
+              - StringEquals:
+                  aws:SourceAccount: !Ref 'AWS::AccountId'
+
+  AllPlatformEventsToFirehoseRule:
+    Type: AWS::Events::Rule
+    Condition: CreateFirehoseRule
+    Properties:
+      Name: !Sub '${NamePrefix}-opensearch-delivery-${EnvironmentName}'
+      Description: Route every event on the bus to Firehose for bulk indexing into OpenSearch.
+      EventBusName: !If [CreateEventBus, !Sub '${NamePrefix}-events-${EnvironmentName}', !Ref EventBusName]
+      EventPattern:
+        account:
+          - !Ref 'AWS::AccountId'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventDeliveryStream.Arn
+          Id: !Sub '${NamePrefix}-opensearch-delivery-${EnvironmentName}'
+          RoleArn: !GetAtt EventsToFirehoseRole.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 20
+            MaximumEventAgeInSeconds: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt EventDeliveryDlq.Arn
 
   # ---------------------------------------------------------------------------
   # 6. CloudWatch alarms — bus health + forwarder guardrails.
@@ -291,7 +840,7 @@ Resources:
       MetricName: FailedInvocations
       Dimensions:
         - Name: EventBusName
-          Value: !Ref PlatformEventBus
+          Value: !If [CreateEventBus, !Sub '${NamePrefix}-events-${EnvironmentName}', !Ref EventBusName]
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 3
@@ -312,7 +861,7 @@ Resources:
       MetricName: ThrottledRules
       Dimensions:
         - Name: EventBusName
-          Value: !Ref PlatformEventBus
+          Value: !If [CreateEventBus, !Sub '${NamePrefix}-events-${EnvironmentName}', !Ref EventBusName]
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 2
@@ -347,7 +896,16 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub '${NamePrefix}-Forwarder-InvocationSpike-${EnvironmentName}'
-      AlarmDescription: Forwarder invocations exceed 10K in 5 minutes — potential runaway.
+      # The threshold counts INVOCATIONS, not events, so it means something
+      # different per mode. In Lambda mode it is one invocation per event, so
+      # 10K/5min is 10K events. In Firehose mode one invocation carries a whole
+      # buffered batch, so the same 10K would be a runaway of a completely
+      # different magnitude — treat a breach here as far more serious, and use
+      # the Firehose Records/DataFreshness metrics for event-rate questions.
+      AlarmDescription: !If
+        - IsFirehoseDelivery
+        - Forwarder transformation invocations exceed 10K in 5 minutes — each carries a full batch.
+        - Forwarder invocations exceed 10K in 5 minutes — potential runaway.
       Namespace: AWS/Lambda
       MetricName: Invocations
       Statistic: Sum
@@ -400,14 +958,92 @@ Resources:
       AlarmActions:
         - !Ref AlertsSnsTopic
 
+  # --- Firehose delivery alarms (DeliveryMode=Firehose only) ---------------
+  #
+  # These replace what the Lambda path could never alarm on. A forwarder that
+  # swallowed its OpenSearch errors reported zero Lambda Errors while dropping
+  # every event; DeliveryToAmazonOpenSearchService.Success is measured by
+  # Firehose, not by our code, so it cannot be masked that way.
+  FirehoseDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateFirehoseStream
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-Firehose-DeliveryFailures-${EnvironmentName}'
+      AlarmDescription: >
+        Firehose is failing to index documents into OpenSearch. Success is the
+        fraction of delivery attempts that landed, so anything below 1 means
+        documents are going to the failed-document S3 prefix instead.
+      Namespace: AWS/Firehose
+      MetricName: DeliveryToAmazonOpenSearchService.Success
+      Dimensions:
+        - Name: DeliveryStreamName
+          Value: !Ref EventDeliveryStream
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsSnsTopic
+      OKActions:
+        - !Ref AlertsSnsTopic
+
+  FirehoseDataFreshnessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateFirehoseStream
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-Firehose-DataFreshness-${EnvironmentName}'
+      AlarmDescription: >
+        Oldest undelivered record in the stream exceeds 15 minutes — delivery is
+        backing up. Catches a stalled stream, which the Success metric does not:
+        a stream delivering nothing at all reports no failures.
+      Namespace: AWS/Firehose
+      MetricName: DeliveryToAmazonOpenSearchService.DataFreshness
+      Dimensions:
+        - Name: DeliveryStreamName
+          Value: !Ref EventDeliveryStream
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 900
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsSnsTopic
+      OKActions:
+        - !Ref AlertsSnsTopic
+
+  EventDeliveryDlqDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateFirehoseStream
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-EventDelivery-DLQ-Depth-${EnvironmentName}'
+      AlarmDescription: EventBridge could not hand events to Firehose — check the delivery DLQ.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventDeliveryDlq.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsSnsTopic
+
 Outputs:
   EventBusName:
     Description: Name of the platform event bus — publish your events here.
-    Value: !Ref PlatformEventBus
+    Value: !If [CreateEventBus, !Sub '${NamePrefix}-events-${EnvironmentName}', !Ref EventBusName]
 
   EventBusArn:
     Description: ARN of the platform event bus.
-    Value: !GetAtt PlatformEventBus.Arn
+    Value: !Sub
+      - 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/${Bus}'
+      - Bus: !If [CreateEventBus, !Sub '${NamePrefix}-events-${EnvironmentName}', !Ref EventBusName]
 
   AlertsSnsTopicArn:
     Description: SNS topic ARN for alerts — subscribe email / Slack / PagerDuty.
@@ -426,3 +1062,50 @@ Outputs:
       Forwarder execution role ARN. For OpenSearch Serverless, add this to a
       data access policy on your collection so the forwarder can write.
     Value: !GetAtt OpenSearchForwarderFunctionRole.Arn
+
+  DeliveryStreamName:
+    Condition: CreateFirehoseStream
+    Description: Firehose stream the bus delivers events through.
+    Value: !Ref EventDeliveryStream
+
+  # The three outputs below exist for CreateForwardingRule=false: everything a
+  # rule in another stack needs to target this pipeline itself.
+  DeliveryStreamArn:
+    Condition: CreateFirehoseStream
+    Description: >
+      Point your own EventBridge rule here when this stack does not own the rule.
+      Pair it with EventsToFirehoseRoleArn as the target's RoleArn.
+    Value: !GetAtt EventDeliveryStream.Arn
+
+  EventsToFirehoseRoleArn:
+    Condition: CreateFirehoseStream
+    Description: >
+      The role EventBridge assumes to put records into the stream. A Firehose
+      target has no resource policy, so the rule must carry this RoleArn — unlike
+      a Lambda target, which uses the invoke permission instead.
+    Value: !GetAtt EventsToFirehoseRole.Arn
+
+  EventDeliveryDlqArn:
+    Condition: CreateFirehoseStream
+    Description: >
+      Dead-letter queue for events EventBridge could never hand to Firehose. Set
+      it as your rule's DeadLetterConfig; it is not the same thing as the
+      failed-document bucket, which catches documents OpenSearch rejected.
+    Value: !GetAtt EventDeliveryDlq.Arn
+
+  FirehoseDeliveryRoleArn:
+    Condition: IsFirehoseDelivery
+    Description: >
+      THE role that must be allowed to write to your OpenSearch domain. Firehose
+      signs every bulk request as this role, not as the forwarder's execution
+      role — so for a cross-account domain, add this ARN as a principal on the
+      domain's access policy in the account that owns the domain. Until you do,
+      every document lands in the failed-document bucket with a 403.
+    Value: !GetAtt FirehoseDeliveryRole.Arn
+
+  FailedDocumentBucketName:
+    Condition: IsFirehoseDelivery
+    Description: >
+      Bucket holding documents OpenSearch rejected, under failed/<env>/.
+      Retained on stack delete.
+    Value: !Ref FailedDocumentBucket
