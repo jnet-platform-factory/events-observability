@@ -29,10 +29,10 @@ Metadata:
     # 1.0.0 fails outright. Minor, not major: every new parameter
     # (ShapingConfig, CreateForwardingRule, EventBusName) defaults to the old
     # behaviour, and nothing was removed.
-    # 1.2.1: documentation only -- the required capabilities differ by
-    # deployment path and were nowhere in the README, so every tenant's first
-    # deploy failed on it.
-    SemanticVersion: 1.2.1
+    # 1.3.0: ForwarderRoleName, so a tenant whose role ARN is named in a
+    # cross-account access policy can pin it instead of letting CloudFormation
+    # generate a name that changes on every replacement.
+    SemanticVersion: 1.3.0
     SourceCodeUrl: https://github.com/junctionnet/platform-infrastructure
 
 Parameters:
@@ -110,6 +110,25 @@ Parameters:
 
       "default" is a valid value, but a dedicated bus is worth having: rules on
       the default bus compete with every AWS service event in the account.
+
+  ForwarderRoleName:
+    Type: String
+    Default: ''
+    Description: >
+      Pin the forwarder's execution role to a fixed name instead of letting
+      CloudFormation generate one.
+
+      Leave blank and SAM names the role, which is fine when the domain is in
+      this account. Set it when the role's ARN is written into an access policy
+      **somewhere else** — a cross-account OpenSearch domain names principals
+      exactly, so a generated name means every replacement of the function
+      silently invalidates the grant and every document starts 403ing with no
+      code change to blame.
+
+      It is also how an existing deployment migrates onto this product without
+      touching the grant at all: reuse the name the old stack used. Note that
+      two stacks cannot hold the same role name at once, so the old one has to
+      release it first.
 
   CreateSearchApi:
     Type: String
@@ -314,6 +333,7 @@ Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
   IsFirehoseDelivery: !Equals [!Ref DeliveryMode, 'Firehose']
   CreateEventBus: !Equals [!Ref EventBusName, '']
+  HasForwarderRoleName: !Not [!Equals [!Ref ForwarderRoleName, '']]
   CreateSearchApiResources: !Equals [!Ref CreateSearchApi, 'true']
   IsEmitEnabled: !Equals [!Ref EnableEmitEndpoint, 'true']
   HasSearchApiAuthorizer: !And
@@ -501,6 +521,41 @@ Resources:
   # parameter and the Lambda path works again without a permissions change. The
   # actions are identical to the ones the Firehose delivery role needs anyway.
   # ---------------------------------------------------------------------------
+  # Only when ForwarderRoleName is set. SAM's `Policies` are ignored once an
+  # explicit `Role` is supplied, so the permissions live here instead — the same
+  # OpenSearch access, plus the basic execution and X-Ray permissions SAM would
+  # otherwise have attached.
+  ForwarderNamedRole:
+    Type: AWS::IAM::Role
+    Condition: HasForwarderRoleName
+    Properties:
+      RoleName: !Ref ForwarderRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess'
+      Policies:
+        - PolicyName: opensearch-write
+          PolicyDocument: !If
+            - IsManagedDomain
+            - Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: [es:ESHttpGet, es:ESHttpHead, es:ESHttpPost, es:ESHttpPut,
+                           es:ESHttpDelete, es:ESHttpPatch]
+                  Resource: !Ref OpenSearchResourceArn
+            - Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: aoss:APIAccessAll
+                  Resource: !Ref OpenSearchResourceArn
+
   OpenSearchForwarderFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -522,6 +577,10 @@ Resources:
       # retries and is gone. One entry point has no such window, and makes the
       # two stacks order-independent.
       Handler: src.handler.lambda_handler
+      # SAM treats Role and Policies as mutually exclusive, so exactly one of
+      # them is present: a pinned name means the role above, carrying the same
+      # permissions; a blank one means SAM generates the role from Policies.
+      Role: !If [HasForwarderRoleName, !GetAtt ForwarderNamedRole.Arn, !Ref 'AWS::NoValue']
       Environment:
         Variables:
           OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
@@ -1248,9 +1307,14 @@ Outputs:
 
   ForwarderRoleArn:
     Description: >
-      Forwarder execution role ARN. For OpenSearch Serverless, add this to a
-      data access policy on your collection so the forwarder can write.
-    Value: !GetAtt OpenSearchForwarderFunctionRole.Arn
+      Forwarder execution role ARN — the principal a cross-account domain must
+      name under DeliveryMode=Lambda, and the one to add to a data access policy
+      for OpenSearch Serverless. Under DeliveryMode=Firehose the writer is
+      FirehoseDeliveryRoleArn instead, not this.
+    Value: !If
+      - HasForwarderRoleName
+      - !GetAtt ForwarderNamedRole.Arn
+      - !GetAtt OpenSearchForwarderFunctionRole.Arn
 
   DeliveryStreamName:
     Condition: CreateFirehoseStream

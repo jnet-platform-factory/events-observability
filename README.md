@@ -4,7 +4,7 @@
 > **This is a published-artifact mirror.**
 >
 > The code here is exactly what Serverless Application Repository version
-> **1.2.1** ships. Development happens in `junctionnet/platform-infrastructure`
+> **1.3.0** ships. Development happens in `junctionnet/platform-infrastructure`
 > under `events-observability/`; this repository is refreshed automatically on
 > release and does not take pull requests.
 >
@@ -163,6 +163,23 @@ in-place update of a stack that already exists.
 a fixed name on purpose — its ARN is written into an OpenSearch access policy,
 possibly in another account, and a CloudFormation-generated name would silently
 invalidate that grant every time the role is replaced.
+
+### Pinning the forwarder's role name
+
+`ForwarderRoleName` fixes the execution role's name instead of letting
+CloudFormation generate one. Leave it blank unless you need it.
+
+You need it when the role's ARN is written into an access policy **somewhere
+else**. A cross-account OpenSearch domain names its principals exactly, so a
+generated name means every replacement of the function silently invalidates the
+grant — and the symptom is every document 403ing with no code change to blame.
+The same reasoning already applies to the Firehose delivery role, which is named
+unconditionally for exactly this reason.
+
+It is also how an existing deployment moves onto this product without touching
+the grant: reuse the name the old stack used, and the principal never changes.
+Two stacks cannot hold one role name at the same time, so the old stack has to
+release it first — which makes the cutover order matter.
 
 ## Firehose against a cross-account domain takes two deploys
 
