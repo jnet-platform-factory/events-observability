@@ -4,7 +4,7 @@
 > **This is a published-artifact mirror.**
 >
 > The code here is exactly what Serverless Application Repository version
-> **1.3.0** ships. Development happens in `junctionnet/platform-infrastructure`
+> **1.4.0** ships. Development happens in `junctionnet/platform-infrastructure`
 > under `events-observability/`; this repository is refreshed automatically on
 > release and does not take pull requests.
 >
@@ -26,7 +26,7 @@ Resources:
     Properties:
       Location:
         ApplicationId: arn:aws:serverlessrepo:us-east-1:<account>:applications/serverless-events-observability
-        SemanticVersion: 1.1.0
+        SemanticVersion: 1.4.0
       Parameters:
         NamePrefix: acme
         EnvironmentName: prod
@@ -37,6 +37,146 @@ Resources:
 
 That is a complete deployment. Publish to the bus it creates and documents start
 appearing in the index.
+
+## Onboarding a new deployment
+
+The quick start above is the whole thing when you own the OpenSearch domain and
+want the default topology. This section is the long way round: every decision,
+in the order you have to make it, and the two that are hard to reverse.
+
+### Decide these four first
+
+| Decision | Parameter | Hard to change later? |
+|---|---|---|
+| What the resources are called | `NamePrefix`, `EnvironmentName` | **Yes** — renaming replaces the roles, and a role name may be written into a domain access policy in another account |
+| Which index | `OpenSearchIndex` | **Yes** — see below |
+| Per-event Lambda, or buffered Firehose | `DeliveryMode` | No — switch and redeploy |
+| Whose rule feeds the forwarder | `CreateForwardingRule` | No |
+
+**The index is the one-way door.** An index with no explicit mapping takes each
+field's type from the first non-null value it ever sees, and that inference is
+permanent. Two deployments sharing an index share that fate: a `"3"` from a test
+stage types the field as text for everyone, and every `sum` over it fails from
+then on. Either give each deployment its own index, or agree the shape once and
+hold it — which is what `ShapingConfig` and the `int` coercer exist to make
+possible. Read "The document, and why its shape is configuration" before you
+pick.
+
+### 1. Deploy
+
+From the Serverless Application Repository, either nested in a template of your
+own (the quick start block) or straight from the console. The minimum is four
+parameters:
+
+```
+NamePrefix             acme            # every resource is ${NamePrefix}-...-${EnvironmentName}
+EnvironmentName        prod
+OpenSearchEndpoint     search-acme-xxxx.us-east-1.es.amazonaws.com
+OpenSearchResourceArn  arn:aws:es:us-east-1:111122223333:domain/acme/*
+```
+
+`OpenSearchIndex` defaults to `${NamePrefix}-events`. Everything else has a
+working default.
+
+If your domain is in a **different account** from this stack, stop after this
+deploy and do step 2 before anything else.
+
+### 2. Grant the stack's role on the domain
+
+The stack signs its writes with SigV4 as its own execution role. A cross-account
+domain will not accept that role until its access policy names it.
+
+Take the role ARN from the stack outputs:
+
+| Output | When |
+|---|---|
+| `ForwarderRoleArn` | `DeliveryMode=Lambda` |
+| `FirehoseDeliveryRoleArn` | `DeliveryMode=Firehose` |
+
+and add it to the domain's access policy. Two things about doing this that cost
+real time to learn:
+
+- **A domain access policy naming a principal that does not resolve is rejected
+  outright** — `409 InvalidTypeException`, roughly **31 minutes** after the
+  update starts. Not at submit time. So deploy the stack first and grant second,
+  never the reverse, and when you remove a deployment, remove the grant *before*
+  the role is deleted. The rule runs in both directions and the feedback loop is
+  half an hour long either way.
+- **Firehose needs read as well as write.** `CreateDeliveryStream` probes the
+  cluster before it will create the stream, and without the read half it fails
+  with a message about the endpoint being unreachable, which is not what is
+  wrong. See "Firehose against a cross-account domain takes two deploys".
+
+### 3. Point events at it
+
+Nothing is forwarded until a rule feeds the forwarder.
+
+- **`CreateForwardingRule=true`** (the default) — the stack creates a rule
+  matching every event in its own account on the bus, and the permission that
+  lets the rule invoke the function. Nothing else to do.
+- **`CreateForwardingRule=false`** — you own the rule. Point it at the
+  `ForwarderFunctionArn` or `DeliveryStreamArn` output. Choose this when the
+  filtering is yours, or when a rule already exists and has to keep its name.
+
+Filtering at the rule is also the cheapest place to filter: an event that never
+matches is never delivered and never billed.
+
+> **Do not point your own rule at the forwarder *and* leave
+> `CreateForwardingRule=true`.** Both rules fire, every event is indexed twice,
+> and the duplicates have distinct ids so nothing dedupes them.
+
+If you point an existing rule at the function yourself, add the invoke
+permission yourself too — `CreateForwardingRule=false` does not create one,
+because it does not know which rule you mean.
+
+### 4. Shape the document
+
+`ShapingConfig` is a JSON field map, not code. The default lifts the conventional
+envelope fields and keeps the whole detail as `payload`. Override it when your
+events call things something else, when a field should be promoted to the top
+level so it can be aggregated, or when a fallback should differ:
+
+```json
+{"defaults": {"application": "acme"},
+ "promote": [{"from": "num_pages", "as": "num_pages", "type": "int"}]}
+```
+
+An invalid config fails at cold start rather than silently shaping differently.
+That is deliberate: a shape change decides an index mapping permanently, so it
+belongs in a reviewed deploy, not in a value someone can edit at runtime.
+
+### 5. Verify before you believe it
+
+A stack that reaches `CREATE_COMPLETE` has proved nothing about delivery. Publish
+a marked event and read it back out of the index:
+
+```bash
+aws events put-events --entries '[{
+  "Source":"acme.verify","DetailType":"Probe",
+  "EventBusName":"<your bus>",
+  "Detail":"{\"organization\":\"probe-001\",\"username\":\"validator\"}"}]'
+```
+
+then query the index for `probe-001`. Under Lambda delivery it is near-immediate;
+under Firehose allow about **2× `FirehoseBufferIntervalSeconds`**, because the
+processing and delivery buffers are in series.
+
+Worth also proving, once, while you still remember what you configured:
+
+| Probe | Expect |
+|---|---|
+| Publish the same event twice | **two** documents — re-ingestion is not deduped |
+| A field you promoted as `int`, sent as `"7"` | lands as `7` |
+| The same field sent as `"seven"` | lands as null, and the document still indexes |
+| An event your rule should not match | never arrives |
+
+### 6. Subscribe to the alarms
+
+The stack creates alarms and an SNS topic, and a topic with no subscription
+fails silently and convincingly — `describe-alarm-history` will report the action
+"successfully executed" into nothing. Set `AlertEmail`, then **confirm the
+subscription**; it sits in `PendingConfirmation` until someone clicks the link,
+and an unconfirmed subscription is the same as no subscription.
 
 ## The document, and why its shape is configuration
 
@@ -163,6 +303,48 @@ in-place update of a stack that already exists.
 a fixed name on purpose — its ARN is written into an OpenSearch access policy,
 possibly in another account, and a CloudFormation-generated name would silently
 invalidate that grant every time the role is replaced.
+
+### Which region to deploy in
+
+The application is published in **us-east-1 and us-west-1**, and the two are
+separate listings with separate ARNs. Deploy from the one matching the region
+your stack lives in.
+
+This is not a convenience. A SAR application exists only in the region it was
+published to, and Lambda requires its code bucket to be in the **same region as
+the function**. Minting a template from another region hands you a `CodeUri`
+pointing at a bucket that Lambda cannot read, and the stack fails with:
+
+```
+S3 Error Code: PermanentRedirect. The bucket you are attempting to access must
+be addressed using the specified endpoint.
+```
+
+Your stack has to sit in the same region as the EventBridge bus it listens to,
+because a rule cannot invoke a Lambda in another region. The OpenSearch domain
+may be anywhere — set `OpenSearchRegion` and the forwarder signs for it. Under
+`DeliveryMode=Firehose` the stream must be in the domain's region, which is the
+one case where the bus and the delivery path can end up split across two stacks.
+
+### If a Region's concurrency limit is small
+
+The alert digest reserves 1 concurrent execution, which is what caps alerts at
+about one email per minute. AWS refuses a reservation that would drop the
+account's unreserved concurrency below 10 — and an **unactivated Region defaults
+to a limit of 10 in total**, so the reservation fails and the stack rolls back:
+
+```
+Specified ReservedConcurrentExecutions for function decreases account's
+UnreservedConcurrentExecution below its minimum value of [10]
+```
+
+Set `DigestReservedConcurrency=0` to reserve none. The digest then shares the
+account pool, and the one-email-per-minute guarantee becomes a tendency rather
+than a cap. Better: raise the Region's limit and leave it at 1.
+
+Worth checking before you pick a Region — `aws lambda get-account-settings`
+in the one you intend to deploy to. A limit of 10 usually means nothing has ever
+run there, which is rarely where you want an event pipeline.
 
 ### Pinning the forwarder's role name
 
