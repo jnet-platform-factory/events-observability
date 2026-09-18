@@ -29,7 +29,10 @@ Metadata:
     # 1.0.0 fails outright. Minor, not major: every new parameter
     # (ShapingConfig, CreateForwardingRule, EventBusName) defaults to the old
     # behaviour, and nothing was removed.
-    SemanticVersion: 1.1.0
+    # 1.2.0: adds the optional search API. Minor, not major -- CreateSearchApi
+    # defaults to false, so an existing tenant's stack is unchanged by the
+    # upgrade. 1.1.0 remains published and broken; see the note in git history.
+    SemanticVersion: 1.2.0
     SourceCodeUrl: https://github.com/junctionnet/platform-infrastructure
 
 Parameters:
@@ -107,6 +110,51 @@ Parameters:
 
       "default" is a valid value, but a dedicated bus is worth having: rules on
       the default bus compete with every AWS service event in the account.
+
+  CreateSearchApi:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Whether to create an HTTP API for searching the archive.
+
+      "false" (default): this stack forwards events and nothing else. No API
+      gateway, no second Lambda, no extra IAM role — a tenant who only wants
+      events indexed pays nothing for a query surface they will not call.
+
+      "true": creates an HTTP API with GET /search, /facets, /{event_id} and
+      /openapi.json over the same index the forwarder writes to. The gateway is
+      created with no custom domain; take the SearchApiEndpoint output and map
+      it yourself, because a domain is yours and this stack should not own DNS.
+
+      **The API is unauthenticated unless you set SearchApiAuthorizerArn.** The
+      archive holds every event on the bus, which is usually more than you want
+      world-readable.
+
+  SearchApiAuthorizerArn:
+    Type: String
+    Default: ''
+    Description: >
+      Search API only. A Lambda authorizer to put in front of every route except
+      /openapi.json. Leave blank and the API is open to anyone who can reach the
+      endpoint.
+
+      The function must already exist and must allow invocation by API Gateway;
+      this stack adds the permission for its own API. Identity source is the
+      Authorization header, with simple responses (the authorizer returns
+      {"isAuthorized": true|false}).
+
+  EnableEmitEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Search API only. Adds POST /emit, which publishes an event to the bus on
+      the caller's behalf — for clients that cannot reach EventBridge directly.
+
+      Off by default because it is the one route that writes. An authenticated
+      event-injection endpoint is a reasonable thing to want and a poor thing to
+      enable without deciding to.
 
   ShapingConfig:
     Type: String
@@ -266,6 +314,11 @@ Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
   IsFirehoseDelivery: !Equals [!Ref DeliveryMode, 'Firehose']
   CreateEventBus: !Equals [!Ref EventBusName, '']
+  CreateSearchApiResources: !Equals [!Ref CreateSearchApi, 'true']
+  IsEmitEnabled: !Equals [!Ref EnableEmitEndpoint, 'true']
+  HasSearchApiAuthorizer: !And
+    - !Equals [!Ref CreateSearchApi, 'true']
+    - !Not [!Equals [!Ref SearchApiAuthorizerArn, '']]
   # Phase 2 of the two-step Firehose rollout — see FirehoseStreamEnabled. The
   # role, bucket and log group come up in phase 1 under IsFirehoseDelivery; only
   # the resources that touch OpenSearch wait for this.
@@ -1034,6 +1087,142 @@ Resources:
       AlarmActions:
         - !Ref AlertsSnsTopic
 
+  # ---------------------------------------------------------------------------
+  # 7. Search API (CreateSearchApi=true) — read side over the same index.
+  #
+  # Absent entirely when not asked for. The forwarder writes and this reads;
+  # they share a repository and an index and nothing else, which is why the API
+  # can be bolted on or left off without touching the delivery path at all.
+  # ---------------------------------------------------------------------------
+  SearchApi:
+    Type: AWS::ApiGatewayV2::Api
+    Condition: CreateSearchApiResources
+    Properties:
+      Name: !Sub '${NamePrefix}-events-api-${EnvironmentName}'
+      Description: Search the application-event archive.
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowHeaders: ['*']
+        AllowMethods: [GET, POST, OPTIONS]
+
+  SearchApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Condition: CreateSearchApiResources
+    Properties:
+      ApiId: !Ref SearchApi
+      # $default, so the stage name never appears in the path. A custom domain
+      # mapped at a base path is then the only thing shaping the URL.
+      StageName: $default
+      AutoDeploy: true
+
+  SearchApiAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Condition: HasSearchApiAuthorizer
+    Properties:
+      ApiId: !Ref SearchApi
+      Name: !Sub '${NamePrefix}-events-api-authorizer-${EnvironmentName}'
+      AuthorizerType: REQUEST
+      AuthorizerPayloadFormatVersion: '2.0'
+      # Simple responses: the authorizer returns {"isAuthorized": true|false}
+      # rather than an IAM policy document.
+      EnableSimpleResponses: true
+      IdentitySource: ['$request.header.Authorization']
+      AuthorizerUri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SearchApiAuthorizerArn}/invocations'
+
+  SearchApiAuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasSearchApiAuthorizer
+    Properties:
+      FunctionName: !Ref SearchApiAuthorizerArn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${SearchApi}/authorizers/${SearchApiAuthorizer}'
+
+  SearchApiFunction:
+    Type: AWS::Serverless::Function
+    Condition: CreateSearchApiResources
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-events-api-${EnvironmentName}'
+      Description: Search the application-event archive in OpenSearch.
+      CodeUri: app/
+      Handler: src.api.lambda_handler
+      MemorySize: 512
+      Timeout: 29  # API Gateway gives up at 29s; a longer timeout cannot be observed
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
+          OPENSEARCH_REGION: !If [HasRegionOverride, !Ref OpenSearchRegion, !Ref 'AWS::Region']
+          OPENSEARCH_INDEX: !Ref OpenSearchIndex
+          OPENSEARCH_SERVICE: !Ref OpenSearchServiceName
+          ENABLE_EMIT_ENDPOINT: !Ref EnableEmitEndpoint
+          EVENT_BUS_NAME: !If [CreateEventBus, !Sub '${NamePrefix}-events-${EnvironmentName}', !Ref EventBusName]
+          POWERTOOLS_SERVICE_NAME: !Sub '${NamePrefix}-events-api'
+          POWERTOOLS_LOG_LEVEL: INFO
+      Policies:
+        # Read-only on the index. The API must not be able to write the archive
+        # it serves — /emit publishes to the bus and lets the forwarder decide.
+        - !If
+          - IsManagedDomain
+          - Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [es:ESHttpGet, es:ESHttpHead, es:ESHttpPost]
+                Resource: !Ref OpenSearchResourceArn
+          - Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !Ref OpenSearchResourceArn
+        - !If
+          - IsEmitEnabled
+          - Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/${Bus}'
+                  - Bus: !If [CreateEventBus, !Sub '${NamePrefix}-events-${EnvironmentName}', !Ref EventBusName]
+          - !Ref 'AWS::NoValue'
+
+  SearchApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateSearchApiResources
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefix}-events-api-${EnvironmentName}'
+      RetentionInDays: 30
+
+  # One proxy route rather than a route per path: the handler already owns its
+  # routing, and a route list here would be a second place to update every time
+  # one is added.
+  SearchApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: CreateSearchApiResources
+    Properties:
+      ApiId: !Ref SearchApi
+      RouteKey: 'ANY /{proxy+}'
+      AuthorizationType: !If [HasSearchApiAuthorizer, CUSTOM, NONE]
+      AuthorizerId: !If [HasSearchApiAuthorizer, !Ref SearchApiAuthorizer, !Ref 'AWS::NoValue']
+      Target: !Sub 'integrations/${SearchApiIntegration}'
+
+  SearchApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: CreateSearchApiResources
+    Properties:
+      ApiId: !Ref SearchApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt SearchApiFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  SearchApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateSearchApiResources
+    Properties:
+      FunctionName: !GetAtt SearchApiFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${SearchApi}/*'
+
 Outputs:
   EventBusName:
     Description: Name of the platform event bus — publish your events here.
@@ -1102,6 +1291,18 @@ Outputs:
       domain's access policy in the account that owns the domain. Until you do,
       every document lands in the failed-document bucket with a 403.
     Value: !GetAtt FirehoseDeliveryRole.Arn
+
+  SearchApiEndpoint:
+    Condition: CreateSearchApiResources
+    Description: >
+      Base URL of the search API. No custom domain is created — map your own to
+      this API if you want a stable hostname.
+    Value: !Sub 'https://${SearchApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+
+  SearchApiId:
+    Condition: CreateSearchApiResources
+    Description: API id, for an ApiMapping onto your own custom domain.
+    Value: !Ref SearchApi
 
   FailedDocumentBucketName:
     Condition: IsFirehoseDelivery

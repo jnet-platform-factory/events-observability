@@ -34,11 +34,22 @@ def shaping_config() -> Dict[str, Any]:
 
 class ServiceFactory:
     @staticmethod
-    def create_app_events_forwarder_service(context: Dict[str, Any] = None) -> AppEventsForwarderService:
-        repository = OpenSearchAppEventsRepository(
+    def create_repository() -> OpenSearchAppEventsRepository:
+        """The index client, for readers as well as the forwarder.
+
+        The search API wants a repository and no service around it; building a
+        forwarder service just to reach through to `.repository` would read as
+        though the API writes.
+        """
+        return OpenSearchAppEventsRepository(
             endpoint=OPENSEARCH_ENDPOINT,
             region=OPENSEARCH_REGION,
             index=OPENSEARCH_INDEX,
             service=OPENSEARCH_SERVICE,
         )
-        return AppEventsForwarderService(repository=repository, context=context)
+
+    @staticmethod
+    def create_app_events_forwarder_service(context: Dict[str, Any] = None) -> AppEventsForwarderService:
+        return AppEventsForwarderService(
+            repository=ServiceFactory.create_repository(), context=context
+        )

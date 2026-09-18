@@ -4,9 +4,9 @@
 > **This is a published-artifact mirror.**
 >
 > The code here is exactly what Serverless Application Repository version
-> **1.1.0** ships. Development happens in `junctionnet/platform-infrastructure`
-> under `events-observability/`; this repository is refreshed per release and
-> does not take pull requests.
+> **1.2.0** ships. Development happens in `junctionnet/platform-infrastructure`
+> under `events-observability/`; this repository is refreshed automatically on
+> release and does not take pull requests.
 >
 > The SAR application is shared with specific AWS accounts rather than published
 > publicly. If you are outside those accounts you can read this source, but the
@@ -144,6 +144,42 @@ cross-account domain cannot be addressed by `DomainARN`.
 which sit in series: the processing buffer before the transform and the delivery
 buffer before the bulk write. Measured end to end: 105s at 60, 41.8s at 30. Set
 it with that doubling in mind if anything reads the index interactively.
+
+## The search API
+
+Off by default. `CreateSearchApi=true` adds an HTTP API over the same index the
+forwarder writes to:
+
+```
+GET /search        filter by source, detail-type, organization, free text, time range
+GET /facets        the distinct (source, detail-type) pairs present
+GET /{event_id}    one archived event
+GET /openapi.json  the generated spec
+```
+
+Results are newest-first and paged (`size`, max 200; `offset`). `payload` comes
+back as an object, not the JSON string it is stored as — the string exists so
+OpenSearch never has to map a per-event shape, and undoing that on the way out is
+this API's job rather than every caller's.
+
+Filters match exactly, on `.keyword` sub-fields. An analysed match would return
+`billing.invoice` for `source=billing`, which is not what a filter means. `q` is
+the one fuzzy parameter and searches the payload text.
+
+**The API is unauthenticated unless you set `SearchApiAuthorizerArn`.** Point it
+at a Lambda authorizer — identity from the `Authorization` header, simple
+responses — and every route but `/openapi.json` goes behind it. The archive holds
+every event on your bus, which is usually more than you want world-readable.
+
+No custom domain is created. Take `SearchApiEndpoint` or `SearchApiId` and map
+your own; DNS is yours, and a stack that forwards events should not own it.
+
+`POST /emit` publishes to the bus on the caller's behalf, for clients that cannot
+reach EventBridge directly. It is behind `EnableEmitEndpoint=true` and off by
+default because it is the only route that writes.
+
+The API's role is read-only on the index. It cannot write the archive it serves —
+`/emit` goes through the bus so the forwarder still decides what gets indexed.
 
 ## Bringing your own bus, or your own rule
 
